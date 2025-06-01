@@ -2,21 +2,28 @@ import streamlit as st
 import json
 import time
 from datetime import datetime, timedelta
-from groq import Groq
 import re
 from typing import List, Dict, Any
 import uuid
 
-# Initialize Groq client
+# LangChain Imports
+from langchain_groq import ChatGroq
+from langchain_core.prompts import ChatPromptTemplate, HumanMessagePromptTemplate, SystemMessagePromptTemplate
+from langchain_core.output_parsers import JsonOutputParser, StrOutputParser
+# For structured output in future, but not strictly necessary for basic StrOutputParser
+from langchain_core.pydantic_v1 import BaseModel, Field
+
+# Initialize Groq client (now a LangChain ChatGroq model)
 
 
-def init_groq_client(api_key: str):
-    return Groq(api_key=api_key)
+def init_groq_model(api_key: str):
+    # Adjust temperature as needed
+    return ChatGroq(api_key=api_key, model_name="llama3-70b-8192", temperature=0.7)
 
 
 class AIInterviewer:
-    def __init__(self, groq_client):
-        self.client = groq_client
+    def __init__(self, groq_model: ChatGroq):
+        self.llm = groq_model  # Store the LangChain ChatGroq model
         self.conversation_history = []
         self.interview_phases = [
             "introduction",
@@ -31,51 +38,82 @@ class AIInterviewer:
         self.start_time = None
         self.target_duration = 40 * 60  # 40 minutes in seconds
 
-    def analyze_resume(self, resume_text: str) -> Dict[str, Any]:
-        """Analyze resume to extract key information for interview preparation"""
+        # Define LangChain output parser for JSON analysis
+        self.analysis_parser = JsonOutputParser()
 
-        prompt = f"""
-        Analyze this resume and extract key information for conducting a technical interview:
-        
-        Resume:
-        {resume_text}
-        
-        Please provide a JSON response with:
-        1. candidate_name: extracted name
-        2. experience_level: junior/mid/senior based on years of experience
-        3. key_skills: list of technical skills mentioned
-        4. programming_languages: list of programming languages
-        5. projects: list of notable projects with brief descriptions
-        6. work_experience: list of companies and roles
-        7. education: educational background
-        8. certifications: any certifications mentioned
-        9. suggested_focus_areas: areas to focus the interview on
-        10. estimated_experience_years: number of years of experience
-        
-        Respond only with valid JSON.
-        """
+        # --- Define LangChain Prompt Templates ---
+        self.resume_analysis_prompt = ChatPromptTemplate.from_messages([
+            SystemMessagePromptTemplate.from_template(
+                """You are an expert HR and technical recruiter. Your task is to analyze a candidate's resume and extract key information.
+                Provide a JSON response with the following keys:
+                - candidate_name: extracted name
+                - experience_level: junior/mid/senior based on years of experience
+                - key_skills: list of technical skills mentioned
+                - programming_languages: list of programming languages
+                - projects: list of notable projects with brief descriptions (keep descriptions very concise)
+                - work_experience: list of companies and roles (e.g., "Software Engineer at Google")
+                - education: educational background (e.g., "M.S. in CS from Stanford")
+                - certifications: any certifications mentioned
+                - suggested_focus_areas: areas to focus the interview on based on the resume strengths/weaknesses
+                - estimated_experience_years: number of years of professional experience (integer)
+                
+                Ensure the response is valid JSON and only contains the JSON object.
+                """
+            ),
+            HumanMessagePromptTemplate.from_template(
+                "Analyze this resume:\n\n{resume_text}")
+        ])
 
-        try:
-            response = self.client.chat.completions.create(
-                model="llama3-70b-8192",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.3,
-                max_tokens=1500
+        self.question_generation_prompt = ChatPromptTemplate.from_messages([
+            SystemMessagePromptTemplate.from_template(
+                """You are an AI interviewer conducting a professional technical interview.
+                Your goal is to ask ONE specific, engaging question that assesses the candidate's skills and experience.
+                Consider the candidate's background and the current interview phase.
+                The question should encourage a detailed answer (2-4 minutes).
+                Be conversational but professional.
+                """
+            ),
+            HumanMessagePromptTemplate.from_template(
+                """Candidate Background:
+                - Name: {candidate_name}
+                - Experience Level: {experience_level}
+                - Key Skills: {key_skills}
+                - Programming Languages: {programming_languages}
+                - Projects: {projects}
+                - Work Experience: {work_experience}
+                - Education: {education}
+                - Certifications: {certifications}
+                - Suggested Focus Areas: {suggested_focus_areas}
+                - Estimated Experience Years: {estimated_experience_years}
+
+                Current Interview Phase: {current_phase_name}
+                Time elapsed: {elapsed_time} minutes ({time_remaining} minutes remaining)
+                
+                Recent conversation context (last 3 exchanges):
+                {conversation_context}
+                
+                Based on the above, generate ONE specific, professional, and engaging interview question.
+                Ensure the question builds naturally on the conversation (if context is provided) and doesn't repeat previous topics.
+                Do not include any conversational filler beyond the question itself. Start directly with the question.
+                """
             )
+        ])
 
-            content = response.choices[0].message.content
-            # Extract JSON from response if it's wrapped in text
-            json_match = re.search(r'\{.*\}', content, re.DOTALL)
-            if json_match:
-                return json.loads(json_match.group())
-            else:
-                return json.loads(content)
+    def analyze_resume(self, resume_text: str) -> Dict[str, Any]:
+        """Analyze resume to extract key information for interview preparation using LangChain."""
+        try:
+            # Create a chain for resume analysis
+            chain = self.resume_analysis_prompt | self.llm | self.analysis_parser
+
+            response = chain.invoke({"resume_text": resume_text})
+            return response
 
         except Exception as e:
-            st.error(f"Error analyzing resume: {e}")
+            st.error(f"Error analyzing resume with LangChain: {e}")
             return self._get_default_analysis()
 
     def _get_default_analysis(self):
+        # ... (unchanged)
         return {
             "candidate_name": "Candidate",
             "experience_level": "mid",
@@ -90,112 +128,56 @@ class AIInterviewer:
         }
 
     def generate_question(self, resume_analysis: Dict, conversation_context: List) -> str:
-        """Generate contextually appropriate interview question"""
-
-        phase_prompts = {
-            "introduction": f"""
-            You are an AI interviewer conducting a professional technical interview. 
-            Generate a warm, professional introduction question for {resume_analysis.get('candidate_name', 'the candidate')}.
-            
-            Consider their background: {resume_analysis.get('experience_level')} level with skills in {', '.join(resume_analysis.get('key_skills', [])[:3])}.
-            
-            Start with a brief introduction of yourself as an AI interviewer, then ask them to introduce themselves and walk through their background.
-            Keep it conversational and professional.
-            """,
-
-            "technical_deep_dive": f"""
-            Based on the candidate's background in {', '.join(resume_analysis.get('key_skills', [])[:5])}, 
-            generate a technical question that explores their depth of knowledge.
-            
-            Focus on: {', '.join(resume_analysis.get('suggested_focus_areas', [])[:3])}
-            Experience level: {resume_analysis.get('experience_level')}
-            
-            Make it challenging but appropriate for their level. Ask about concepts, best practices, or implementation details.
-            """,
-
-            "experience_exploration": f"""
-            Ask about their specific work experience and projects. 
-            They have worked on: {', '.join([p.get('name', p.get('description', 'a project')) for p in resume_analysis.get('projects', [])[:2]])}
-            Work experience: {', '.join(resume_analysis.get('work_experience', [])[:2])}
-            
-            Ask them to elaborate on a specific project or role, focusing on challenges they faced and how they solved them.
-            """,
-
-            "problem_solving": """
-            Present a practical coding or system design problem that requires analytical thinking.
-            Make it relevant to their skill set but challenging enough to assess problem-solving approach.
-            Ask them to walk through their thought process step by step.
-            """,
-
-            "behavioral_questions": """
-            Ask a behavioral question about teamwork, leadership, conflict resolution, or handling difficult situations.
-            Use the STAR method framework (Situation, Task, Action, Result) and ask for specific examples.
-            """,
-
-            "scenario_based": f"""
-            Present a real-world scenario related to {resume_analysis.get('experience_level')} level work in {', '.join(resume_analysis.get('key_skills', [])[:2])}.
-            Ask how they would approach it, what considerations they would have, and what potential challenges they foresee.
-            """,
-
-            "closing": """
-            Generate a closing question for the interview. Ask if they have any questions about the role, 
-            company, or interview process. Also ask about their career goals and what they're looking for in their next opportunity.
-            """
-        }
-
+        """Generate contextually appropriate interview question using LangChain."""
         current_phase_name = self.interview_phases[self.current_phase]
-        base_prompt = phase_prompts.get(
-            current_phase_name, phase_prompts["technical_deep_dive"])
 
-        # Add conversation context
-        context = ""
+        # Prepare context for the prompt
+        context_str = ""
         if conversation_context:
-            recent_context = conversation_context[-3:]  # Last 3 exchanges
-            context = f"""
-            Recent conversation context:
-            {json.dumps(recent_context, indent=2)}
-            
-            Build upon this conversation naturally. Don't repeat similar questions.
-            """
+            # Get last 3 exchanges and format them for the prompt
+            recent_context_formatted = []
+            for exchange in conversation_context[-3:]:
+                recent_context_formatted.append(
+                    f"Interviewer: {exchange['question']}")
+                if exchange.get('response'):
+                    recent_context_formatted.append(
+                        f"Candidate: {exchange['response']}")
+            context_str = "\n".join(recent_context_formatted)
 
-        full_prompt = f"""
-        {base_prompt}
-        
-        {context}
-        
-        Current interview phase: {current_phase_name}
-        Time elapsed: {self._get_elapsed_time()} minutes
-        
-        Generate ONE specific, engaging question. Be conversational but professional.
-        The question should take 2-4 minutes to answer thoroughly.
-        """
+        elapsed_time_minutes = self._get_elapsed_time()
+        time_remaining_minutes = max(
+            0, int((self.target_duration - (time.time() - self.start_time)) / 60))
+
+        input_data = {
+            "candidate_name": resume_analysis.get('candidate_name', 'the candidate'),
+            "experience_level": resume_analysis.get('experience_level'),
+            "key_skills": ", ".join(resume_analysis.get('key_skills', [])[:5]),
+            "programming_languages": ", ".join(resume_analysis.get('programming_languages', [])),
+            "projects": ", ".join([p.get('name', p.get('description', 'a project')) for p in resume_analysis.get('projects', [])[:2]]),
+            "work_experience": ", ".join(resume_analysis.get('work_experience', [])[:2]),
+            "education": ", ".join(resume_analysis.get('education', [])),
+            "certifications": ", ".join(resume_analysis.get('certifications', [])),
+            "suggested_focus_areas": ", ".join(resume_analysis.get('suggested_focus_areas', [])[:3]),
+            "estimated_experience_years": resume_analysis.get('estimated_experience_years'),
+            "current_phase_name": current_phase_name,
+            "elapsed_time": elapsed_time_minutes,
+            "time_remaining": time_remaining_minutes,
+            "conversation_context": context_str
+        }
 
         try:
-            response = self.client.chat.completions.create(
-                model="llama3-70b-8192",
-                messages=[{"role": "user", "content": full_prompt}],
-                temperature=0.7,
-                max_tokens=300
-            )
+            # Create a chain for question generation
+            # Use StrOutputParser for the natural language question output
+            chain = self.question_generation_prompt | self.llm | StrOutputParser()
 
-            return response.choices[0].message.content.strip()
+            question = chain.invoke(input_data)
+            return question.strip()
 
         except Exception as e:
-            st.error(f"Error generating question: {e}")
+            st.error(f"Error generating question with LangChain: {e}")
             return self._get_fallback_question(current_phase_name)
 
-    def _get_fallback_question(self, phase: str):
-        fallback_questions = {
-            "introduction": "Could you please introduce yourself and tell me about your background?",
-            "technical_deep_dive": "Can you explain a complex technical concept you've worked with recently?",
-            "experience_exploration": "Tell me about a challenging project you've worked on and how you approached it.",
-            "problem_solving": "How would you approach debugging a performance issue in a web application?",
-            "behavioral_questions": "Describe a time when you had to work with a difficult team member. How did you handle it?",
-            "scenario_based": "If you were tasked with improving the performance of a slow database query, what steps would you take?",
-            "closing": "Do you have any questions for me about the role or the company?"
-        }
-        return fallback_questions.get(phase, "Can you tell me more about your experience?")
-
+    # ... (rest of the class methods remain unchanged)
     def should_continue_interview(self) -> bool:
         """Determine if interview should continue based on time and phases"""
         if not self.start_time:
@@ -223,9 +205,20 @@ class AIInterviewer:
         self.conversation_history = []
         self.current_phase = 0
 
-# New function for response actions
+    def _get_fallback_question(self, phase: str):
+        fallback_questions = {
+            "introduction": "Could you please introduce yourself and tell me about your background?",
+            "technical_deep_dive": "Can you explain a complex technical concept you've worked with recently?",
+            "experience_exploration": "Tell me about a challenging project you've worked on and how you approached it.",
+            "problem_solving": "How would you approach debugging a performance issue in a web application?",
+            "behavioral_questions": "Describe a time when you had to work with a difficult team member. How did you handle it?",
+            "scenario_based": "If you were tasked with improving the performance of a slow database query, what steps would you take?",
+            "closing": "Do you have any questions for me about the role or the company?"
+        }
+        return fallback_questions.get(phase, "Can you tell me more about your experience?")
 
 
+# New function for response actions (remains unchanged as it's UI logic)
 def display_response_actions(interviewer: AIInterviewer, current_exchange: Dict[str, Any], response_key: str):
     response = st.text_area(
         "Response",
@@ -281,7 +274,7 @@ def main():
         initial_sidebar_state="expanded"
     )
 
-    # Custom CSS for better UI
+    # Custom CSS for better UI (unchanged)
     st.markdown("""
     <style>
     .main-header {
@@ -348,7 +341,7 @@ def main():
     </style>
     """, unsafe_allow_html=True)
 
-    # Main header with gradient background
+    # Main header with gradient background (unchanged)
     st.markdown("""
     <div class="main-header">
         <h1>🤖 AI Technical Interviewer</h1>
@@ -356,11 +349,10 @@ def main():
     </div>
     """, unsafe_allow_html=True)
 
-    # Enhanced Sidebar for configuration
+    # Enhanced Sidebar for configuration (unchanged, except for client init)
     with st.sidebar:
         st.markdown("### 🔧 Configuration")
 
-        # Groq API Key input with better styling
         groq_api_key = st.text_input(
             "🔑 Groq API Key",
             type="password",
@@ -377,13 +369,12 @@ def main():
 
         st.markdown("---")
 
-        # Interview Progress Section
+        # Interview Progress Section (unchanged)
         st.markdown("### 📊 Interview Progress")
 
         if 'interviewer' in st.session_state and st.session_state.interviewer.start_time:
             elapsed = st.session_state.interviewer._get_elapsed_time()
 
-            # Time metrics with better layout
             col1, col2 = st.columns(2)
             with col1:
                 st.metric("⏱️ Elapsed", f"{elapsed} min")
@@ -391,12 +382,10 @@ def main():
                 remaining = max(0, 40 - elapsed)
                 st.metric("⏳ Remaining", f"{remaining} min")
 
-            # Progress bar with percentage
             progress = min(elapsed / 40, 1.0)
             st.progress(progress)
             st.caption(f"Progress: {int(progress * 100)}%")
 
-            # Current phase indicator
             current_phase = st.session_state.interviewer.interview_phases[
                 st.session_state.interviewer.current_phase]
             phase_display = current_phase.replace('_', ' ').title()
@@ -408,7 +397,6 @@ def main():
             </div>
             """, unsafe_allow_html=True)
 
-            # Phase progress
             phase_progress = (st.session_state.interviewer.current_phase + 1) / \
                 len(st.session_state.interviewer.interview_phases)
             st.progress(phase_progress)
@@ -420,7 +408,7 @@ def main():
 
         st.markdown("---")
 
-        # Interview Statistics
+        # Interview Statistics (unchanged)
         if 'conversation_history' in st.session_state and st.session_state.conversation_history:
             st.markdown("### 📈 Session Stats")
 
@@ -441,7 +429,7 @@ def main():
                                        total_questions) * 100
                     st.metric("📊 Completion", f"{completion_rate:.0f}%")
 
-    # Initialize session state
+    # Initialize session state (unchanged)
     if 'conversation_history' not in st.session_state:
         st.session_state.conversation_history = []
     if 'resume_analyzed' not in st.session_state:
@@ -451,7 +439,7 @@ def main():
     if 'interview_started' not in st.session_state:
         st.session_state.interview_started = False
 
-    # Main interface with enhanced error handling
+    # Main interface with enhanced error handling (unchanged, except for client init)
     if not groq_api_key:
         st.markdown("""
         <div style="background-color: #fff3cd; padding: 2rem; border-radius: 10px; border-left: 4px solid #ffc107; margin: 2rem 0;">
@@ -468,20 +456,20 @@ def main():
         """, unsafe_allow_html=True)
         return
 
-    # Initialize interviewer
+    # Initialize interviewer (MODIFIED: Use init_groq_model)
     if 'interviewer' not in st.session_state:
         try:
-            client = init_groq_client(groq_api_key)
-            st.session_state.interviewer = AIInterviewer(client)
+            # Pass the LangChain ChatGroq model instance
+            llm_model = init_groq_model(groq_api_key)
+            st.session_state.interviewer = AIInterviewer(llm_model)
         except Exception as e:
-            st.error(f"Error initializing AI interviewer: {e}")
+            st.error(f"Error initializing AI interviewer with LangChain: {e}")
             return
 
-    # Resume upload and analysis with enhanced UI
+    # Resume upload and analysis with enhanced UI (unchanged)
     if not st.session_state.resume_analyzed:
         st.markdown("## 📄 Resume Analysis")
 
-        # Create tabs for different input methods
         tab1, tab2 = st.tabs(["📝 Paste Resume Text", "📁 Upload File"])
 
         resume_text = ""
@@ -533,7 +521,6 @@ The more detailed your resume, the better the AI can tailor the interview!""",
                     st.success(
                         f"✅ File '{uploaded_file.name}' uploaded successfully!")
 
-                    # Show preview
                     with st.expander("📖 Preview uploaded content"):
                         st.text_area("File Content Preview", resume_text[:500] + "..." if len(
                             resume_text) > 500 else resume_text, height=150, disabled=True)
@@ -541,7 +528,6 @@ The more detailed your resume, the better the AI can tailor the interview!""",
                 except Exception as e:
                     st.error(f"❌ Error reading file: {e}")
 
-        # Analysis button with enhanced styling
         st.markdown("---")
 
         col1, col2, col3 = st.columns([1, 2, 1])
@@ -549,7 +535,6 @@ The more detailed your resume, the better the AI can tailor the interview!""",
             if st.button("🚀 Analyze Resume & Start Interview", type="primary", use_container_width=True):
                 if resume_text.strip():
                     with st.spinner("🔍 Analyzing your resume and preparing personalized interview questions..."):
-                        # Show progress steps
                         progress_bar = st.progress(0)
                         status_text = st.empty()
 
@@ -581,7 +566,6 @@ The more detailed your resume, the better the AI can tailor the interview!""",
                     st.error(
                         "❌ Please provide your resume content before starting the interview.")
 
-        # Instructions section
         with st.expander("💡 Tips for Best Results", expanded=False):
             st.markdown("""
             **For the most effective interview experience:**
@@ -605,15 +589,13 @@ The more detailed your resume, the better the AI can tailor the interview!""",
             The AI will use this information to create a personalized 40+ minute interview experience!
             """)
 
-    # Enhanced Interview interface
+    # Enhanced Interview interface (unchanged)
     if st.session_state.resume_analyzed and st.session_state.interview_started:
         st.markdown("## 🎤 Interview Session")
 
-        # Display enhanced resume analysis summary
         with st.expander("📊 Resume Analysis Summary", expanded=False):
             analysis = st.session_state.resume_analysis
 
-            # Overview metrics
             st.markdown("### 👤 Candidate Overview")
             col1, col2, col3, col4 = st.columns(4)
 
@@ -637,7 +619,6 @@ The more detailed your resume, the better the AI can tailor the interview!""",
                 projects_count = len(analysis.get('projects', []))
                 st.metric("📁 Projects", projects_count)
 
-            # Detailed breakdown
             col1, col2 = st.columns(2)
 
             with col1:
@@ -665,7 +646,6 @@ The more detailed your resume, the better the AI can tailor the interview!""",
                     for exp in analysis.get('work_experience', [])[:3]:
                         st.markdown(f"• {exp}")
 
-        # Interview statistics dashboard
         if st.session_state.conversation_history:
             st.markdown("""
             <div class="interview-stats">
@@ -694,15 +674,12 @@ The more detailed your resume, the better the AI can tailor the interview!""",
 
         st.markdown("---")
 
-        # Chat interface with enhanced styling
         st.markdown("### 💬 Interview Conversation")
 
-        # Create a scrollable chat container
         chat_container = st.container()
 
         with chat_container:
             for i, exchange in enumerate(st.session_state.conversation_history):
-                # AI Question with enhanced styling
                 st.markdown(f"""
                 <div class="chat-message ai-message">
                     <div style="display: flex; align-items: center; margin-bottom: 0.5rem;">
@@ -718,7 +695,6 @@ The more detailed your resume, the better the AI can tailor the interview!""",
                 </div>
                 """, unsafe_allow_html=True)
 
-                # User Response with enhanced styling
                 if exchange.get('response'):
                     response_text = exchange['response']
                     response_color = "#d4edda" if response_text != "[Skipped]" else "#f8d7da"
@@ -737,12 +713,9 @@ The more detailed your resume, the better the AI can tailor the interview!""",
                     </div>
                     """, unsafe_allow_html=True)
 
-                # Add spacing between exchanges
-                st.markdown("<br>", unsafe_allow_html=True)
+                    st.markdown("<br>", unsafe_allow_html=True)
 
-        # Current question interface with enhanced UX
         if st.session_state.interviewer.should_continue_interview():
-            # Generate new question if needed
             if not st.session_state.conversation_history or st.session_state.conversation_history[-1].get('response'):
                 with st.spinner("🤔 AI is preparing your next question..."):
                     question = st.session_state.interviewer.generate_question(
@@ -758,11 +731,9 @@ The more detailed your resume, the better the AI can tailor the interview!""",
                     })
                     st.rerun()
 
-            # Show current question with enhanced styling
             current_exchange = st.session_state.conversation_history[-1]
 
             if not current_exchange.get('response'):
-                # Current question display
                 current_phase = current_exchange.get(
                     'phase', 'interview').replace('_', ' ').title()
                 question_number = len(st.session_state.conversation_history)
@@ -776,35 +747,24 @@ The more detailed your resume, the better the AI can tailor the interview!""",
                             <small style="color: #6c757d;">Question {question_number} • {current_phase} Phase</small>
                         </div>
                     </div>
-                    <div style="font-size: 1.1em; line-height: 1.6; margin-left: 3rem;">
-                        {current_exchange['question']}
-                    </div>
-                </div>
                 """, unsafe_allow_html=True)
+                # Display the actual question content from the current exchange
+                st.markdown(
+                    f"<p style='font-size: 1.1em;'>{current_exchange['question']}</p>", unsafe_allow_html=True)
+                # Close the question-box div
+                st.markdown("</div>", unsafe_allow_html=True)
 
-                # Response input area with enhanced styling
-                st.markdown("""
-                <div class="response-area">
-                    <h5>💭 Your Response:</h5>
-                    <p style="color: #6c757d; margin-bottom: 1rem;">
-                        Take your time to provide a thoughtful, detailed response. The AI is looking for your reasoning process and technical understanding.
-                    </p>
-                </div>
-                """, unsafe_allow_html=True)
-
-                # Call the new function for response actions
+                # Response actions for the current question
                 display_response_actions(
-                    st.session_state.interviewer,
-                    current_exchange,
-                    f"response_{len(st.session_state.conversation_history)}"
-                )
+                    st.session_state.interviewer, current_exchange, f"response_input_{uuid.uuid4()}")
         else:
-            st.success("🎉 Interview Completed! Thank you for participating.")
-            st.info(
-                "You can refresh the page to start a new interview or review the conversation history above.")
-            st.markdown("---")
-            if st.button("Start New Interview", type="primary"):
-                st.session_state.clear()
+            st.markdown("### 🎉 Interview Completed!")
+            st.info("You have completed the interview. Thank you for participating!")
+            # Add options for feedback or next steps
+            if st.button("Start New Interview"):
+                # Clear session state to restart
+                for key in st.session_state.keys():
+                    del st.session_state[key]
                 st.rerun()
 
 
